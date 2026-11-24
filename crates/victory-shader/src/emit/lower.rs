@@ -5454,7 +5454,7 @@ impl<'a> Lower<'a> {
         // from another use of the same descriptor.
         let cube_array = *dim == 3
             && !*a16
-            && (image_cube_array(self.x.p, inst)
+            && (self.cube_array_operand(inst)
                 || (name == "image_get_resinfo" && self.cube_array_source(src)));
         let (kind, coords) = match dim {
             0 => (1, 1),
@@ -5729,11 +5729,10 @@ impl<'a> Lower<'a> {
                 *slot = to_float(self, x);
             }
             if matches!(kind, 5 | 9) {
-                let face = cs[2];
-                let dir = self.cube_direction(cs[0], cs[1], face, kind == 9);
+                let (dir, slice) = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
                 if kind == 9 {
-                    cs[3] = self.cube_layer(face);
+                    cs[3] = slice;
                 }
             }
             if *unorm {
@@ -5975,11 +5974,17 @@ impl<'a> Lower<'a> {
     /// console takes s and t in [1, 2] (`v_cubesc`/`v_cubetc` over
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
-    /// A cube array keeps its slice in the low three bits of the face
-    /// operand and passes `floor(face / 8)` as DXIL's fourth coordinate.
-    fn cube_direction(&mut self, s: V, t: V, face: V, array: bool) -> [V; 3] {
+    /// A cube array's face operand is `8 × slice + face`; the low three bits
+    /// of the operand are the face and the rest is the slice, which becomes
+    /// DXIL's fourth coordinate. The split uses powers of two, so it is exact.
+    fn cube_direction(&mut self, s: V, t: V, face: V) -> ([V; 3], V) {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
+        let (eighth, eight) = (k(self, 0.125), k(self, 8.0));
+        let slice = self.s.m.bin(c, Bin::Mul, face, eighth);
+        let slice = self.unary(27, slice); // Round_ni
+        let whole = self.s.m.bin(c, Bin::Mul, slice, eight);
+        let face = self.s.m.bin(c, Bin::Sub, face, whole);
         let (two, three) = (k(self, 2.0), k(self, 3.0));
         let u = self.s.m.bin(c, Bin::Mul, s, two);
         let u = self.s.m.bin(c, Bin::Sub, u, three);
@@ -5992,19 +5997,13 @@ impl<'a> Lower<'a> {
         );
         let (one, mone) = (k(self, 1.0), k(self, -1.0));
         let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
-        let f = if array {
-            let seven = self.s.m.i32(7);
-            self.s.m.bin(c, Bin::And, f, seven)
-        } else {
-            f
-        };
         // Per face +x, -x, +y, -y, +z, -z.
         let table = [
             [one, mone, u, u, u, nu],
             [nv, nv, one, mone, nv, nv],
             [nu, u, v, nv, one, mone],
         ];
-        table.map(|row| {
+        let dir = table.map(|row| {
             let mut r = row[0];
             for (n, &x) in row.iter().enumerate().skip(1) {
                 let kn = self.s.m.i32(n as u32);
@@ -6012,23 +6011,76 @@ impl<'a> Lower<'a> {
                 r = self.s.m.select(c, is, x, r);
             }
             r
-        })
+        });
+        (dir, slice)
     }
 
     /// A size query has no face operand; take the array dimension from
     /// another image use of the same descriptor, which does.
     fn cube_array_source(&self, src: &Source) -> bool {
-        cube_array_source_from(self.x.p, &self.descriptors, src)
+        cube_array_source_from(self.x.p, &self.descriptors, src, |inst| {
+            self.cube_array_operand(inst)
+        })
     }
 
-    /// The layer of a cube array sample: `floor(face / 8)`, where the face
-    /// operand is `8 × layer + face`.
-    fn cube_layer(&mut self, face: V) -> V {
-        let c = self.cur;
-        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
-        let three = self.s.m.i32(3);
-        let layer = self.s.m.bin(c, Bin::LShr, f, three);
-        self.as_float(layer)
+    /// Whether the face operand of a cube sample is `8 × slice + face`: a
+    /// constant of 8 or more, or a multiply-add by 8.0 in either multiplied
+    /// operand. The lineage follows a move and the lowering's constants.
+    fn cube_array_operand(&self, inst: &Inst) -> bool {
+        const EIGHT: u32 = 0x4100_0000; // 8.0
+        let Some(reg) = image_face_reg(inst) else {
+            return false;
+        };
+        let Some(v) = inst.read(Reg::V(reg)) else {
+            return false;
+        };
+        if image_cube_array(self.x.p, inst) {
+            return true;
+        }
+        let constant = |v: Value| match self.vals.get(&v) {
+            Some(&Val::I32(x)) => self.s.m.int_value(x).map(|x| x as u32),
+            _ => None,
+        };
+        if let Some(bits) = constant(v) {
+            return f32::from_bits(bits) >= 8.0;
+        }
+        let Some(def) = self
+            .x
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|d| d.writes.iter().any(|w| w.1 == v))
+        else {
+            return false;
+        };
+        let Fields::Valu(fields) = &def.fields else {
+            return false;
+        };
+        if !matches!(
+            def.name(),
+            "v_fma_f32"
+                | "v_fmac_f32"
+                | "v_fmamk_f32"
+                | "v_fmaak_f32"
+                | "v_mad_f32"
+                | "v_mac_f32"
+                | "v_madmk_f32"
+                | "v_madak_f32"
+        ) || fields.neg & 3 != 0
+        {
+            return false;
+        }
+        // The multiplied operands come first (`fmamk`'s K is the second).
+        fields.src.iter().take(2).any(|op| match *op {
+            Operand::Literal(x) => x == EIGHT,
+            Operand::Const(c) => crate::resource::inline(c) == Some(EIGHT),
+            Operand::Scalar { code, .. } => {
+                def.read(Reg::S(code)).and_then(constant) == Some(EIGHT)
+            }
+            Operand::Vector { reg, .. } => def.read(Reg::V(reg)).and_then(constant) == Some(EIGHT),
+            Operand::Attr { .. } => false,
+        })
     }
 
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -6827,29 +6879,32 @@ impl<'a> Lower<'a> {
     }
 }
 
-fn cube_array_source_from(
+fn cube_array_source_from<F>(
     p: &Program,
     descriptors: &HashMap<(Site, bool), &Source>,
     src: &Source,
-) -> bool {
-    descriptors.iter().any(|(&((b, i), sampler), &s)| {
-        !sampler && s == src && image_cube_array(p, &p.blocks[b].insts[i])
-    })
+    is_array: F,
+) -> bool
+where
+    F: Fn(&Inst) -> bool,
+{
+    descriptors
+        .iter()
+        .any(|(&((b, i), sampler), &s)| !sampler && s == src && is_array(&p.blocks[b].insts[i]))
 }
 
-/// Whether `inst` is a cube sample or gather whose face operand is the
-/// cube-array encoding. The face follows any bias, comparison reference,
-/// offset and explicit gradients in the address list.
-fn image_cube_array(p: &Program, inst: &Inst) -> bool {
+/// The VGPR holding the face operand of a cube sample or gather. The face
+/// follows any bias, comparison reference, offset and explicit gradients.
+fn image_face_reg(inst: &Inst) -> Option<u8> {
     let name = inst.name();
     if !(name.starts_with("image_sample") || name.starts_with("image_gather")) {
-        return false;
+        return None;
     }
     let Fields::Image { addr, dim, a16, .. } = &inst.fields else {
-        return false;
+        return None;
     };
     if *dim != 3 || *a16 {
-        return false;
+        return None;
     }
     let mut regs = Vec::new();
     for a in addr {
@@ -6861,8 +6916,16 @@ fn image_cube_array(p: &Program, inst: &Inst) -> bool {
     let compare = usize::from(name.starts_with("image_sample_c"));
     let grads = usize::from(name.contains("_d")) * 4;
     let face = offset + usize::from(name == "image_sample_b") + compare + grads + 2;
-    regs.get(face)
-        .and_then(|&r| inst.read(Reg::V(r)))
+    regs.get(face).copied()
+}
+
+/// Whether `inst` is a cube sample or gather whose face operand is the
+/// cube-array encoding, without consulting the lowering's constant values.
+fn image_cube_array(p: &Program, inst: &Inst) -> bool {
+    let Some(reg) = image_face_reg(inst) else {
+        return false;
+    };
+    inst.read(Reg::V(reg))
         .is_some_and(|v| cube_array_face(p, v))
 }
 
@@ -7222,10 +7285,14 @@ mod tests {
         let source = Source::Constant(vec![0]);
         let mut descriptors: HashMap<(Site, bool), &Source> = HashMap::new();
         descriptors.insert(((b, i), false), &source);
-        assert!(cube_array_source_from(&p, &descriptors, &source));
+        assert!(cube_array_source_from(&p, &descriptors, &source, |inst| {
+            image_cube_array(&p, inst)
+        }));
 
         let other = Source::Constant(vec![1]);
-        assert!(!cube_array_source_from(&p, &descriptors, &other));
+        assert!(!cube_array_source_from(&p, &descriptors, &other, |inst| {
+            image_cube_array(&p, inst)
+        }));
     }
 
     #[test]
