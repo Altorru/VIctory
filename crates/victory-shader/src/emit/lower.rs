@@ -6027,59 +6027,9 @@ impl<'a> Lower<'a> {
     /// constant of 8 or more, or a multiply-add by 8.0 in either multiplied
     /// operand. The lineage follows a move and the lowering's constants.
     fn cube_array_operand(&self, inst: &Inst) -> bool {
-        const EIGHT: u32 = 0x4100_0000; // 8.0
-        let Some(reg) = image_face_reg(inst) else {
-            return false;
-        };
-        let Some(v) = inst.read(Reg::V(reg)) else {
-            return false;
-        };
-        if image_cube_array(self.x.p, inst) {
-            return true;
-        }
-        let constant = |v: Value| match self.vals.get(&v) {
+        cube_array_operand_with(self.x.p, inst, |v| match self.vals.get(&v) {
             Some(&Val::I32(x)) => self.s.m.int_value(x).map(|x| x as u32),
             _ => None,
-        };
-        if let Some(bits) = constant(v) {
-            return f32::from_bits(bits) >= 8.0;
-        }
-        let Some(def) = self
-            .x
-            .p
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .find(|d| d.writes.iter().any(|w| w.1 == v))
-        else {
-            return false;
-        };
-        let Fields::Valu(fields) = &def.fields else {
-            return false;
-        };
-        if !matches!(
-            def.name(),
-            "v_fma_f32"
-                | "v_fmac_f32"
-                | "v_fmamk_f32"
-                | "v_fmaak_f32"
-                | "v_mad_f32"
-                | "v_mac_f32"
-                | "v_madmk_f32"
-                | "v_madak_f32"
-        ) || fields.neg & 3 != 0
-        {
-            return false;
-        }
-        // The multiplied operands come first (`fmamk`'s K is the second).
-        fields.src.iter().take(2).any(|op| match *op {
-            Operand::Literal(x) => x == EIGHT,
-            Operand::Const(c) => crate::resource::inline(c) == Some(EIGHT),
-            Operand::Scalar { code, .. } => {
-                def.read(Reg::S(code)).and_then(constant) == Some(EIGHT)
-            }
-            Operand::Vector { reg, .. } => def.read(Reg::V(reg)).and_then(constant) == Some(EIGHT),
-            Operand::Attr { .. } => false,
         })
     }
 
@@ -6919,6 +6869,60 @@ fn image_face_reg(inst: &Inst) -> Option<u8> {
     regs.get(face).copied()
 }
 
+/// Whether the face operand of a cube sample is the cube-array encoding,
+/// with the lowering's constant values supplied by `constant`.
+fn cube_array_operand_with<F>(p: &Program, inst: &Inst, constant: F) -> bool
+where
+    F: Fn(Value) -> Option<u32>,
+{
+    const EIGHT: u32 = 0x4100_0000; // 8.0
+    let Some(reg) = image_face_reg(inst) else {
+        return false;
+    };
+    let Some(v) = inst.read(Reg::V(reg)) else {
+        return false;
+    };
+    if image_cube_array(p, inst) {
+        return true;
+    }
+    if let Some(bits) = constant(v) {
+        return f32::from_bits(bits) >= 8.0;
+    }
+    let Some(def) = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find(|d| d.writes.iter().any(|w| w.1 == v))
+    else {
+        return false;
+    };
+    let Fields::Valu(fields) = &def.fields else {
+        return false;
+    };
+    if !matches!(
+        def.name(),
+        "v_fma_f32"
+            | "v_fmac_f32"
+            | "v_fmamk_f32"
+            | "v_fmaak_f32"
+            | "v_mad_f32"
+            | "v_mac_f32"
+            | "v_madmk_f32"
+            | "v_madak_f32"
+    ) || fields.neg & 3 != 0
+    {
+        return false;
+    }
+    // The multiplied operands come first (`fmamk`'s K is the second).
+    fields.src.iter().take(2).any(|op| match *op {
+        Operand::Literal(x) => x == EIGHT,
+        Operand::Const(c) => crate::resource::inline(c) == Some(EIGHT),
+        Operand::Scalar { code, .. } => def.read(Reg::S(code)).and_then(&constant) == Some(EIGHT),
+        Operand::Vector { reg, .. } => def.read(Reg::V(reg)).and_then(&constant) == Some(EIGHT),
+        Operand::Attr { .. } => false,
+    })
+}
+
 /// Whether `inst` is a cube sample or gather whose face operand is the
 /// cube-array encoding, without consulting the lowering's constant values.
 fn image_cube_array(p: &Program, inst: &Inst) -> bool {
@@ -6988,8 +6992,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Numeric, Parts, buffer_format, cube_array_face, cube_array_source_from, half_shift,
-        image_cube_array, lower,
+        Numeric, Parts, buffer_format, cube_array_face, cube_array_operand_with,
+        cube_array_source_from, half_shift, image_cube_array, image_face_reg, lower,
     };
     use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
     use crate::resource::{Site, Source};
@@ -7256,6 +7260,37 @@ mod tests {
             .find(|i| i.name() == "image_sample")
             .unwrap();
         assert!(!image_cube_array(&p, image));
+    }
+
+    #[test]
+    fn cube_array_operand_reads_a_constant_face() {
+        // v_mov_b32 v3, 8.0 then image_sample cube: the face is not an fma,
+        // so only the lowering's constant path can recognize the slice.
+        let words = [
+            0x7E04_02FF, // v_mov_b32 v2, literal
+            0x4100_0000, // 8.0
+            0x7E06_02FF, // v_mov_b32 v3, literal
+            0x4100_0000, // 8.0
+            0xF080_0F18, // image_sample cube, dmask 0xF
+            0x0000_0400, // v[1:3], [v0:v2]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let image = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "image_sample")
+            .unwrap();
+        let face_reg = image_face_reg(image).expect("cube face operand");
+        let face = image.read(crate::ir::Reg::V(face_reg)).unwrap();
+        assert!(cube_array_operand_with(&p, image, |v| {
+            (v == face).then_some(0x4100_0000)
+        }));
+        assert!(!cube_array_operand_with(&p, image, |v| {
+            (v == face).then_some(0)
+        }));
     }
 
     #[test]
