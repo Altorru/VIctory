@@ -5436,6 +5436,22 @@ impl<'a> Lower<'a> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
+        // Address VGPRs in order.
+        let mut regs = Vec::new();
+        for a in addr {
+            if let Operand::Vector { reg, dwords } = *a {
+                regs.extend((0..dwords).map(|k| reg + k));
+            }
+        }
+        // A cube array encodes its slice in the face operand as
+        // `8 × layer + face`; a plain cube passes `v_cubeid` alone.
+        let cube_array = *dim == 3
+            && !*a16
+            && (name.starts_with("image_sample") || name.starts_with("image_gather"))
+            && regs
+                .get(2)
+                .and_then(|&r| inst.read(Reg::V(r)))
+                .is_some_and(|v| cube_array_face(self.x.p, v));
         let (kind, coords) = match dim {
             0 => (1, 1),
             1 => (2, 2),
@@ -5446,19 +5462,16 @@ impl<'a> Lower<'a> {
                 || name.starts_with("image_gather")
                 || name == "image_get_resinfo" =>
             {
-                (5, 3)
+                if cube_array {
+                    (9, 4)
+                } else {
+                    (5, 3)
+                }
             }
             4 => (6, 2),
             5 => (7, 3),
             _ => return Err("an image dimension (cube loads or MSAA)"),
         };
-        // Address VGPRs in order.
-        let mut regs = Vec::new();
-        for a in addr {
-            if let Operand::Vector { reg, dwords } = *a {
-                regs.extend((0..dwords).map(|k| reg + k));
-            }
-        }
         // With a16, two 16-bit components per VGPR, low half first.
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
             let r = *regs
@@ -5668,6 +5681,11 @@ impl<'a> Lower<'a> {
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
         let r = if sample {
+            // A cube sample's coordinates are face coordinates; explicit
+            // gradients and level queries on one are not lowered yet.
+            if matches!(kind, 5 | 9) && (*unorm || op == 63 || op == 81) {
+                return Err("a cube sample with texel coordinates, gradients or a level query");
+            }
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -5686,8 +5704,13 @@ impl<'a> Lower<'a> {
             let first =
                 usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
-            // gradients (x then y) come before the coordinates.
-            let spatial = coords - usize::from(kind == 6 || kind == 7);
+            // gradients (x then y) come before the coordinates. A cube's
+            // spatial coordinates are just s and t.
+            let spatial = match kind {
+                5 | 9 => 2,
+                6 | 7 => coords - 1,
+                _ => coords,
+            };
             let grads = if op == 63 { 2 * spatial } else { 0 };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
@@ -5699,16 +5722,20 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // The console address has one VGPR less than DXIL's cube-array
+            // coordinate: the layer is decoded from the face operand.
+            let addr_coords = coords - usize::from(kind == 9);
+            for (k, slot) in cs.iter_mut().enumerate().take(addr_coords) {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
-            if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
-                }
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+            if matches!(kind, 5 | 9) {
+                let face = cs[2];
+                let dir = self.cube_direction(cs[0], cs[1], face, kind == 9);
                 cs[..3].copy_from_slice(&dir);
+                if kind == 9 {
+                    cs[3] = self.cube_layer(face);
+                }
             }
             if *unorm {
                 // Texel coordinates: divided by the size of level 0.
@@ -5745,7 +5772,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            let offsets = if kind == 5 {
+            let offsets = if matches!(kind, 5 | 9) {
                 0
             } else {
                 (coords - usize::from(kind == 6 || kind == 7)).min(3)
@@ -5833,7 +5860,7 @@ impl<'a> Lower<'a> {
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
+                        let x = addr_val(self, addr_coords)?;
                         to_float(self, x)
                     } else {
                         self.s.m.f32(0)
@@ -5949,9 +5976,9 @@ impl<'a> Lower<'a> {
     /// console takes s and t in [1, 2] (`v_cubesc`/`v_cubetc` over
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
-    // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
-    fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
+    /// A cube array keeps its slice in the low three bits of the face
+    /// operand and passes `floor(face / 8)` as DXIL's fourth coordinate.
+    fn cube_direction(&mut self, s: V, t: V, face: V, array: bool) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
         let (two, three) = (k(self, 2.0), k(self, 3.0));
@@ -5966,6 +5993,12 @@ impl<'a> Lower<'a> {
         );
         let (one, mone) = (k(self, 1.0), k(self, -1.0));
         let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        let f = if array {
+            let seven = self.s.m.i32(7);
+            self.s.m.bin(c, Bin::And, f, seven)
+        } else {
+            f
+        };
         // Per face +x, -x, +y, -y, +z, -z.
         let table = [
             [one, mone, u, u, u, nu],
@@ -5981,6 +6014,16 @@ impl<'a> Lower<'a> {
             }
             r
         })
+    }
+
+    /// The layer of a cube array sample: `floor(face / 8)`, where the face
+    /// operand is `8 × layer + face`.
+    fn cube_layer(&mut self, face: V) -> V {
+        let c = self.cur;
+        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        let three = self.s.m.i32(3);
+        let layer = self.s.m.bin(c, Bin::LShr, f, three);
+        self.as_float(layer)
     }
 
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -6779,9 +6822,63 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Whether `face` is built as `8 × layer + face`, the encoding a cube-map
+/// array uses for its slice. A plain cube's face comes from `v_cubeid`.
+fn cube_array_face(p: &Program, face: Value) -> bool {
+    let mut value = face;
+    for _ in 0..4 {
+        let Some(inst) = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.writes.iter().any(|(_, v)| *v == value))
+        else {
+            return false;
+        };
+        match inst.name() {
+            "v_mov_b32" => {
+                let Fields::Valu(v) = &inst.fields else {
+                    return false;
+                };
+                let Some(op) = v.src.first().copied() else {
+                    return false;
+                };
+                let Some(next) = operand_value(inst, op) else {
+                    return false;
+                };
+                value = next;
+            }
+            "v_fma_f32" | "v_fmaak_f32" | "v_fmamk_f32" | "v_fmac_f32" | "v_mac_f32"
+            | "v_mac_legacy_f32" | "v_mad_f32" | "v_madak_f32" | "v_madmk_f32"
+            | "v_mad_legacy_f32" => {
+                let Fields::Valu(v) = &inst.fields else {
+                    return false;
+                };
+                // Only a multiplicand: an 8 added after the product is not
+                // a layer.
+                return v
+                    .src
+                    .iter()
+                    .take(2)
+                    .any(|o| matches!(o, Operand::Literal(0x4100_0000)));
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn operand_value(inst: &Inst, op: Operand) -> Option<Value> {
+    match op {
+        Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+        Operand::Scalar { code, .. } => inst.read(Reg::S(code)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Numeric, Parts, buffer_format, cube_array_face, half_shift, lower};
     use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
     use crate::{io, ir, resource, structure};
 
@@ -6962,6 +7059,50 @@ mod tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
             lowers(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn cube_array_face_follows_an_eight_times_fma() {
+        // v_fma_f32 v0, v1, 8.0, v2 is the 8 * layer + face form; with
+        // the literal in src2 it is just an addend and must not match.
+        let program = |literal_src1: bool| {
+            let (src1, src2) = if literal_src1 {
+                (0xFF, 0x102)
+            } else {
+                (0x102, 0xFF)
+            };
+            let words = [
+                0xD54B_0000, // v_fma_f32 v0, v1, ..., ...
+                0x101 | (src1 << 9) | (src2 << 18),
+                0x4100_0000, // 8.0
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            ir::build(&code, false, 256).unwrap()
+        };
+        let p = program(true);
+        let fma = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "v_fma_f32")
+            .unwrap();
+        assert!(cube_array_face(
+            &p,
+            fma.write(crate::ir::Reg::V(0)).unwrap()
+        ));
+
+        let p = program(false);
+        let fma = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "v_fma_f32")
+            .unwrap();
+        assert!(!cube_array_face(
+            &p,
+            fma.write(crate::ir::Reg::V(0)).unwrap()
+        ));
     }
 
     #[test]
