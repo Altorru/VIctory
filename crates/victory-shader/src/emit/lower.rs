@@ -7294,6 +7294,22 @@ mod tests {
     }
 
     #[test]
+    fn cube_resinfo_words_decode() {
+        // Matches IMAGE_GET_RESINFO_CUBE in valu_tests.rs: dmask 0x4 selects
+        // the layer count, dim 3 is CUBE.
+        let words = [0xF038_0418, 3 << 16 | 1, S_ENDPGM];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let image = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "image_get_resinfo")
+            .expect("image_get_resinfo");
+        assert_eq!(image.name(), "image_get_resinfo");
+    }
+
+    #[test]
     fn cube_array_size_query_follows_its_descriptor() {
         let words = [
             0xD54B_0002, // v_fma_f32 v2, v3, 8.0, v4

@@ -969,6 +969,9 @@ const fn s_load_dwordx8(dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
 /// `image_sample_lz v0, v[1:3], s[12:19], s[20:23] dmask:0x1 dim:CUBE`.
 const IMAGE_SAMPLE_LZ_CUBE: [u32; 2] = [0xF09C_0118, 3 << 16 | 5 << 21 | 1];
 
+/// `image_get_resinfo v0, v1, s[12:19] dmask:0x4 dim:CUBE` (the layer count).
+const IMAGE_GET_RESINFO_CUBE: [u32; 2] = [0xF038_0418, 3 << 16 | 1];
+
 /// A cube-sampling program: the image at heap index 1 in `s[12:19]`, an
 /// immediate point sampler in `s[20:23]`, then `face` (which leaves the face
 /// operand in `v3`) and the sample into `v0`.
@@ -977,6 +980,31 @@ fn cube_sample_cs(face: &[u32]) -> HostShader {
     body.extend((20..24).map(|s| s_mov_b32(s, 0x80)));
     body.extend_from_slice(face);
     body.extend_from_slice(&IMAGE_SAMPLE_LZ_CUBE);
+    build_cs(
+        &body,
+        &[UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot: 1,
+        }],
+    )
+}
+
+/// A cube-array size query after a sample of the same descriptor, so the
+/// query can infer that the view is an array and read its cube count.
+fn cube_resinfo_cs() -> HostShader {
+    let mut body = s_load_dwordx8(12, 4, 32).to_vec();
+    body.extend((20..24).map(|s| s_mov_b32(s, 0x80)));
+    let mut fma = vop3(0x14B, 3, vgpr(3), 255, vgpr(4)).to_vec();
+    fma.push(8.0f32.to_bits());
+    body.extend(fma);
+    body.extend_from_slice(&IMAGE_SAMPLE_LZ_CUBE);
+    body.extend_from_slice(&IMAGE_GET_RESINFO_CUBE);
     build_cs(
         &body,
         &[UsedResource {
@@ -1033,5 +1061,15 @@ fn cube_samples_read_the_face_of_a_bare_operand() {
     run_cases_with(&shader, &views, &cases, |backend, _, inp, got| {
         let face = f32::from_bits(inp[3]);
         assert_eq!(f32::from_bits(got), face, "{backend}: face {face}");
+    });
+}
+
+#[test]
+fn cube_array_resinfo_reads_the_cube_count() {
+    let shader = cube_resinfo_cs();
+    let texels = numbered_faces(3);
+    let views = [View::RawUav(1), View::CubeArray(1, 3, &texels)];
+    run_cases_with(&shader, &views, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 3, "{backend}: cube-array layer count");
     });
 }
