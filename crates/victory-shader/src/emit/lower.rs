@@ -5443,15 +5443,19 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
+        let src = self
+            .descriptors
+            .get(&(site, false))
+            .copied()
+            .ok_or("an untracked image")?;
         // A cube array encodes its slice in the face operand as
-        // `8 × layer + face`; a plain cube passes `v_cubeid` alone.
+        // `8 × layer + face`; a plain cube passes `v_cubeid` alone. A size
+        // query has no face operand of its own, so it takes the dimension
+        // from another use of the same descriptor.
         let cube_array = *dim == 3
             && !*a16
-            && (name.starts_with("image_sample") || name.starts_with("image_gather"))
-            && regs
-                .get(2)
-                .and_then(|&r| inst.read(Reg::V(r)))
-                .is_some_and(|v| cube_array_face(self.x.p, v));
+            && (image_cube_array(self.x.p, inst)
+                || (name == "image_get_resinfo" && self.cube_array_source(src)));
         let (kind, coords) = match dim {
             0 => (1, 1),
             1 => (2, 2),
@@ -5487,11 +5491,6 @@ impl<'a> Lower<'a> {
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
-        let src = self
-            .descriptors
-            .get(&(site, false))
-            .copied()
-            .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
         let uav = store
             || self
@@ -6014,6 +6013,12 @@ impl<'a> Lower<'a> {
             }
             r
         })
+    }
+
+    /// A size query has no face operand; take the array dimension from
+    /// another image use of the same descriptor, which does.
+    fn cube_array_source(&self, src: &Source) -> bool {
+        cube_array_source_from(self.x.p, &self.descriptors, src)
     }
 
     /// The layer of a cube array sample: `floor(face / 8)`, where the face
@@ -6822,6 +6827,45 @@ impl<'a> Lower<'a> {
     }
 }
 
+fn cube_array_source_from(
+    p: &Program,
+    descriptors: &HashMap<(Site, bool), &Source>,
+    src: &Source,
+) -> bool {
+    descriptors.iter().any(|(&((b, i), sampler), &s)| {
+        !sampler && s == src && image_cube_array(p, &p.blocks[b].insts[i])
+    })
+}
+
+/// Whether `inst` is a cube sample or gather whose face operand is the
+/// cube-array encoding. The face follows any bias, comparison reference,
+/// offset and explicit gradients in the address list.
+fn image_cube_array(p: &Program, inst: &Inst) -> bool {
+    let name = inst.name();
+    if !(name.starts_with("image_sample") || name.starts_with("image_gather")) {
+        return false;
+    }
+    let Fields::Image { addr, dim, a16, .. } = &inst.fields else {
+        return false;
+    };
+    if *dim != 3 || *a16 {
+        return false;
+    }
+    let mut regs = Vec::new();
+    for a in addr {
+        if let Operand::Vector { reg, dwords } = *a {
+            regs.extend((0..dwords).map(|k| reg + k));
+        }
+    }
+    let offset = usize::from(name.ends_with("_o"));
+    let compare = usize::from(name.starts_with("image_sample_c"));
+    let grads = usize::from(name.contains("_d")) * 4;
+    let face = offset + usize::from(name == "image_sample_b") + compare + grads + 2;
+    regs.get(face)
+        .and_then(|&r| inst.read(Reg::V(r)))
+        .is_some_and(|v| cube_array_face(p, v))
+}
+
 /// Whether `face` is built as `8 × layer + face`, the encoding a cube-map
 /// array uses for its slice. A plain cube's face comes from `v_cubeid`.
 fn cube_array_face(p: &Program, face: Value) -> bool {
@@ -6878,8 +6922,14 @@ fn operand_value(inst: &Inst, op: Operand) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, cube_array_face, half_shift, lower};
+    use std::collections::HashMap;
+
+    use super::{
+        Numeric, Parts, buffer_format, cube_array_face, cube_array_source_from, half_shift,
+        image_cube_array, lower,
+    };
     use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::resource::{Site, Source};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -7103,6 +7153,79 @@ mod tests {
             &p,
             fma.write(crate::ir::Reg::V(0)).unwrap()
         ));
+    }
+
+    #[test]
+    fn cube_array_image_uses_the_face_operand() {
+        // image_sample cube with 8.0 as the multiplier of the face, then
+        // with 8.0 as the addend (which must not be taken for a layer).
+        let program = |literal_src1: bool| {
+            let (src1, src2) = if literal_src1 {
+                (0xFF, 0x104)
+            } else {
+                (0x104, 0xFF)
+            };
+            let words = [
+                0xD54B_0002, // v_fma_f32 v2, v3, ..., ...
+                0x103 | (src1 << 9) | (src2 << 18),
+                0x4100_0000, // 8.0
+                0xF080_0F18, // image_sample cube, dmask 0xF
+                0x0000_0400, // v[4:7], [v0:v2]
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            ir::build(&code, false, 256).unwrap()
+        };
+        let p = program(true);
+        let image = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "image_sample")
+            .unwrap();
+        assert!(image_cube_array(&p, image));
+
+        let p = program(false);
+        let image = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "image_sample")
+            .unwrap();
+        assert!(!image_cube_array(&p, image));
+    }
+
+    #[test]
+    fn cube_array_size_query_follows_its_descriptor() {
+        let words = [
+            0xD54B_0002, // v_fma_f32 v2, v3, 8.0, v4
+            0x103 | (0xFF << 9) | (0x104 << 18),
+            0x4100_0000, // 8.0
+            0xF080_0F18, // image_sample cube, dmask 0xF
+            0x0000_0400, // v[4:7], [v0:v2]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let (b, i) = p
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(b, block)| {
+                block
+                    .insts
+                    .iter()
+                    .position(|inst| inst.name() == "image_sample")
+                    .map(|i| (b, i))
+            })
+            .unwrap();
+        let source = Source::Constant(vec![0]);
+        let mut descriptors: HashMap<(Site, bool), &Source> = HashMap::new();
+        descriptors.insert(((b, i), false), &source);
+        assert!(cube_array_source_from(&p, &descriptors, &source));
+
+        let other = Source::Constant(vec![1]);
+        assert!(!cube_array_source_from(&p, &descriptors, &other));
     }
 
     #[test]
