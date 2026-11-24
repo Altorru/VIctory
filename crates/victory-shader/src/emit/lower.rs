@@ -5474,6 +5474,22 @@ impl<'a> Lower<'a> {
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
+        // A cube array's face operand is 8 × slice + face. GFX10 MIMG has no
+        // array bit, so a cube array (DXIL kind 9) is told by how the operand
+        // is made (see `cube_array_operand`).
+        // shortcut: 16-bit coordinates and size queries stay plain cubes.
+        let kind = if kind == 5 && !*a16 && name != "image_get_resinfo" {
+            let face = usize::from(name.ends_with("_o"))
+                + usize::from(name == "image_sample_b")
+                + usize::from(name.starts_with("image_sample_c"))
+                + 2;
+            match regs.get(face) {
+                Some(&r) if self.cube_array_operand(inst, r) => 9,
+                _ => 5,
+            }
+        } else {
+            kind
+        };
         let src = self
             .descriptors
             .get(&(site, false))
@@ -5703,12 +5719,15 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
-            if kind == 5 {
+            if matches!(kind, 5 | 9) {
                 if *unorm || op == 63 || op == 81 {
                     return Err("a cube sample with texel coordinates, gradients or a level query");
                 }
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                let (dir, slice) = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
+                if kind == 9 {
+                    cs[3] = slice;
+                }
             }
             if *unorm {
                 // Texel coordinates: divided by the size of level 0.
@@ -5745,7 +5764,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            let offsets = if kind == 5 {
+            let offsets = if matches!(kind, 5 | 9) {
                 0
             } else {
                 (coords - usize::from(kind == 6 || kind == 7)).min(3)
@@ -5948,12 +5967,18 @@ impl<'a> Lower<'a> {
     /// The direction a cube sample's face coordinates stand for: the
     /// console takes s and t in [1, 2] (`v_cubesc`/`v_cubetc` over
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
-    /// host's cube sampling turns back into the same texel.
-    // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
-    fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
+    /// host's cube sampling turns back into the same texel. A cube array's
+    /// face operand adds 8 × the slice (`ffma(slice, 8.0, face)`), so the
+    /// face is the operand less that, and the slice comes back too.
+    fn cube_direction(&mut self, s: V, t: V, face: V) -> ([V; 3], V) {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
+        // Exact: 0.125 and 8 are powers of two.
+        let (eighth, eight) = (k(self, 0.125), k(self, 8.0));
+        let slice = self.s.m.bin(c, Bin::Mul, face, eighth);
+        let slice = self.unary(27, slice); // Round_ni
+        let whole = self.s.m.bin(c, Bin::Mul, slice, eight);
+        let face = self.s.m.bin(c, Bin::Sub, face, whole);
         let (two, three) = (k(self, 2.0), k(self, 3.0));
         let u = self.s.m.bin(c, Bin::Mul, s, two);
         let u = self.s.m.bin(c, Bin::Sub, u, three);
@@ -5972,7 +5997,7 @@ impl<'a> Lower<'a> {
             [nv, nv, one, mone, nv, nv],
             [nu, u, v, nv, one, mone],
         ];
-        table.map(|row| {
+        let dir = table.map(|row| {
             let mut r = row[0];
             for (n, &x) in row.iter().enumerate().skip(1) {
                 let kn = self.s.m.i32(n as u32);
@@ -5980,6 +6005,63 @@ impl<'a> Lower<'a> {
                 r = self.s.m.select(c, is, x, r);
             }
             r
+        });
+        (dir, slice)
+    }
+
+    /// Whether the face operand a cube sample reads from VGPR `reg` holds
+    /// 8 × slice + face, so that the view is a cube array: a constant of 8
+    /// or more, or a multiply-add by 8.0, which is how compilers build it
+    /// (`v_cubeid_f32` alone gives 0-5). Anything else is taken as a cube.
+    fn cube_array_operand(&self, inst: &Inst, reg: u8) -> bool {
+        const EIGHT: u32 = 0x4100_0000; // 8.0
+        // A value's bits when the lowering has it as a constant.
+        let constant = |v: Value| match self.vals.get(&v) {
+            Some(&Val::I32(x)) => self.s.m.int_value(x).map(|x| x as u32),
+            _ => None,
+        };
+        let Some(v) = inst.read(Reg::V(reg)) else {
+            return false;
+        };
+        if let Some(bits) = constant(v) {
+            return f32::from_bits(bits) >= 8.0;
+        }
+        let Some(def) = self
+            .x
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|d| d.writes.iter().any(|w| w.1 == v))
+        else {
+            return false;
+        };
+        let Fields::Valu(fields) = &def.fields else {
+            return false;
+        };
+        if !matches!(
+            def.name(),
+            "v_fma_f32"
+                | "v_fmac_f32"
+                | "v_fmamk_f32"
+                | "v_fmaak_f32"
+                | "v_mad_f32"
+                | "v_mac_f32"
+                | "v_madmk_f32"
+                | "v_madak_f32"
+        ) || fields.neg & 3 != 0
+        {
+            return false;
+        }
+        // The multiplied operands come first (`fmamk`'s K is the second).
+        fields.src.iter().take(2).any(|op| match *op {
+            Operand::Literal(x) => x == EIGHT,
+            Operand::Const(c) => crate::resource::inline(c) == Some(EIGHT),
+            Operand::Scalar { code, .. } => {
+                def.read(Reg::S(code)).and_then(constant) == Some(EIGHT)
+            }
+            Operand::Vector { reg, .. } => def.read(Reg::V(reg)).and_then(constant) == Some(EIGHT),
+            Operand::Attr { .. } => false,
         })
     }
 

@@ -3,9 +3,11 @@
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
-//! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
+//! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`; and the
+//! face operand of cube-array samples, built by a VALU multiply-add.
 
 use super::host::{Dispatch, Host, Root, View};
+use super::sampler::StaticSampler;
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -69,6 +71,11 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, &[])
+}
+
+/// [`build_valu_cs`] with more table resources (`used`) for `body` to read.
+fn build_cs(body: &[u32], used: &[UsedResource]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -114,7 +121,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             dwords: 4,
             user_data: 4,
             slot: 1,
-        }],
+        }]
+        .into_iter()
+        .chain(used.iter().copied())
+        .collect(),
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
             threads: [1, 1, 1],
@@ -143,8 +153,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        static_samplers: lowered
+            .samplers
+            .iter()
+            .map(|&w| StaticSampler::from_words(w))
+            .collect(),
         samplers: lowered.samplers,
-        static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
     };
@@ -163,6 +177,16 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
     shader: &HostShader,
+    cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_with(shader, &[View::RawUav(1)], cases, check);
+}
+
+/// [`run_cases`] with these views in the table (the result UAV first).
+fn run_cases_with(
+    shader: &HostShader,
+    views: &[View],
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
@@ -195,7 +219,7 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views,
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -931,5 +955,83 @@ fn v_cmp_class_f16_matches_rdna2() {
             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
+    });
+}
+
+/// SMEM `s_load_dwordx8 s[dst:dst+7], s[base:base+1], byte_off` (soffset = null).
+const fn s_load_dwordx8(dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | byte_off,
+    ]
+}
+
+/// `image_sample_lz v0, v[1:3], s[12:19], s[20:23] dmask:0x1 dim:CUBE`.
+const IMAGE_SAMPLE_LZ_CUBE: [u32; 2] = [0xF09C_0118, 3 << 16 | 5 << 21 | 1];
+
+/// A cube-sampling program: the image at heap index 1 in `s[12:19]`, an
+/// immediate point sampler in `s[20:23]`, then `face` (which leaves the face
+/// operand in `v3`) and the sample into `v0`.
+fn cube_sample_cs(face: &[u32]) -> HostShader {
+    let mut body = s_load_dwordx8(12, 4, 32).to_vec();
+    body.extend((20..24).map(|s| s_mov_b32(s, 0x80)));
+    body.extend_from_slice(face);
+    body.extend_from_slice(&IMAGE_SAMPLE_LZ_CUBE);
+    build_cs(
+        &body,
+        &[UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot: 1,
+        }],
+    )
+}
+
+/// Texels of `cubes` cubes of 1×1 faces, each holding `10 × cube + face`.
+fn numbered_faces(cubes: u32) -> Vec<[f32; 4]> {
+    (0..6 * cubes)
+        .map(|i| [(10 * (i / 6) + i % 6) as f32, 0.0, 0.0, 1.0])
+        .collect()
+}
+
+#[test]
+fn cube_array_samples_read_the_slice_and_face_of_the_operand() {
+    // The face operand as compilers build it for a cube array:
+    // v3 = v_fma_f32(slice, 8.0, face).
+    let mut fma = vop3(0x14B, 3, vgpr(3), 255, vgpr(4)).to_vec();
+    fma.push(8.0f32.to_bits());
+    let shader = cube_sample_cs(&fma);
+    let texels = numbered_faces(3);
+    let views = [View::RawUav(1), View::CubeArray(1, 3, &texels)];
+    let at = |slice: u32, face: u32| [1.5f32, 1.5, slice as f32, face as f32].map(f32::to_bits);
+    let cases = [at(0, 0), at(0, 2), at(1, 2), at(1, 5), at(2, 1), at(2, 4)];
+    run_cases_with(&shader, &views, &cases, |backend, _, inp, got| {
+        let (slice, face) = (f32::from_bits(inp[2]), f32::from_bits(inp[3]));
+        let want = 10.0 * slice + face;
+        assert_eq!(
+            f32::from_bits(got),
+            want,
+            "{backend}: slice {slice}, face {face}",
+        );
+    });
+}
+
+#[test]
+fn cube_samples_read_the_face_of_a_bare_operand() {
+    // A plain cube: the face id as is (v3 = v4), on a cube view.
+    let shader = cube_sample_cs(&[vop1(0x001, 3, vgpr(4))]);
+    let texels = numbered_faces(1);
+    let views = [View::RawUav(1), View::Cube(1, &texels)];
+    let cases: Vec<[u32; 4]> = (0..6)
+        .map(|face| [1.5f32, 1.5, 0.0, face as f32].map(f32::to_bits))
+        .collect();
+    run_cases_with(&shader, &views, &cases, |backend, _, inp, got| {
+        let face = f32::from_bits(inp[3]);
+        assert_eq!(f32::from_bits(got), face, "{backend}: face {face}");
     });
 }
