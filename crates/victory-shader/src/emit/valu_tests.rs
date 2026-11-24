@@ -996,7 +996,7 @@ fn cube_sample_cs(face: &[u32]) -> HostShader {
 }
 
 /// A cube-array size query after a sample of the same descriptor, so the
-/// query can infer that the view is an array and read its cube count.
+/// query can infer that the view is an array and read its face count.
 fn cube_resinfo_cs() -> HostShader {
     let mut body = s_load_dwordx8(12, 4, 32).to_vec();
     body.extend((20..24).map(|s| s_mov_b32(s, 0x80)));
@@ -1065,11 +1065,12 @@ fn cube_samples_read_the_face_of_a_bare_operand() {
 }
 
 #[test]
-fn cube_array_resinfo_reads_the_cube_count() {
+fn cube_array_resinfo_reads_the_face_count() {
     let shader = cube_resinfo_cs();
     let texels = numbered_faces(3);
     let views = [View::RawUav(1), View::CubeArray(1, 3, &texels)];
     run_cases_with(&shader, &views, &[[0; 4]], |backend, _, _, got| {
-        assert_eq!(got, 3, "{backend}: cube-array layer count");
+        // The console reports a cube array's layers in faces: 6 × 3 cubes.
+        assert_eq!(got, 18, "{backend}: cube-array face count");
     });
 }

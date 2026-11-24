@@ -5660,12 +5660,22 @@ impl<'a> Lower<'a> {
                 2 | 5 | 6 => [true, true, false, true],
                 _ => [true, true, true, true],
             };
+            // D3D's getDimensions reports a cube array's NumCubes; the console
+            // counts its layers in faces, so resinfo's fourth channel is 6 ×
+            // that (Mesa lowers a cube-array size query by dividing by 6).
+            let layers = (kind == 9).then(|| {
+                let z = self.s.m.extract(c, d, 2);
+                let six = self.s.m.i32(6);
+                self.s.m.bin(c, Bin::Mul, z, six)
+            });
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                 let x = if ch == 3 && uav || !present[ch as usize] {
                     one
+                } else if let (2, Some(layers)) = (ch, layers) {
+                    layers
                 } else {
                     self.s.m.extract(c, d, ch)
                 };
@@ -7296,7 +7306,7 @@ mod tests {
     #[test]
     fn cube_resinfo_words_decode() {
         // Matches IMAGE_GET_RESINFO_CUBE in valu_tests.rs: dmask 0x4 selects
-        // the layer count, dim 3 is CUBE.
+        // the layer count (faces), dim 3 is CUBE.
         let words = [0xF038_0418, 3 << 16 | 1, S_ENDPGM];
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = ir::build(&code, false, 256).unwrap();
