@@ -53,6 +53,18 @@ Three readings, and they are not comfortable ones:
   this port's own share of `vram_used`, so an overrun can be attributed instead of guessed.
 - **The card's own account of itself** — `card_span_*`: submissions a frame (in hundredths),
   the card working, the card idle between submissions, the longest one.
+- **`Play-VIctory-8GB.cmd warm`** — not a run: it makes the pipelines the title uses ahead
+  of time from the book the runs write (`VICTORY_PIPELINE_BOOK=1`, set by the launcher),
+  so the first world frame stops compiling more than 1,200 pipelines while you watch. That
+  compile is the shape of the 300–600 ms frames.
+- **A third argument, `60`** — `Play-VIctory-8GB.cmd 1080p perf 60` lifts the title's own
+  30 fps interval to 16.7 ms. The title asks for 30 itself, so without this a run is capped
+  at 33.3 ms whatever the laptop can do; this is the measurement that shows the headroom,
+  not a fix (it can tear).
+- **`VICTORY_WATER_LIGHT=0`** — leaves out the two tiled water-light programs, which on a
+  32-lane host cost about 15 ms of the card a frame and leave dark blocks on open water.
+  Ported from VIctory-NVIDIA, where it was measured on an RTX 5070 (25 → 30 fps); off by
+  default here because it changes the picture: the water comes out darker and bluer.
 
 ## Build and run
 

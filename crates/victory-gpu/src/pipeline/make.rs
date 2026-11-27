@@ -70,6 +70,42 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+/// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`, the title's 1.0.2.1): programs of one 64-lane wave a group, which
+/// a host of 32-lane waves gets only in the wave-wide form (4 and 7 branches taken wave-wide).
+/// In that form they leave whole tiles of open water dark - around boats, along shores, under
+/// bridges - and cost about 15 ms of the card a frame.
+///
+/// Taken from VIctory-NVIDIA (`crates/victory-gpu/src/pipeline/make.rs`, GPL-3.0-or-later),
+/// where it was measured on an RTX 5070: 25 fps with them, 30 without, the blocks gone, the
+/// water darker and bluer. Theirs leaves them out; ours keeps them unless told otherwise,
+/// because a switch that changes the picture is not a default here - a run with correct water
+/// and no dark blocks is a different picture, not a strictly better one.
+///
+/// `VICTORY_WATER_LIGHT=0` leaves the two out (the 15 ms and the blocks go with them);
+/// unset or `1` keeps them, exactly as upstream.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+/// Whether the water's light is kept (`VICTORY_WATER_LIGHT`, unset: kept).
+fn water_light_kept() -> bool {
+    static KEPT: OnceLock<bool> = OnceLock::new();
+    *KEPT.get_or_init(|| std::env::var("VICTORY_WATER_LIGHT").map_or(true, |v| v.trim() != "0"))
+}
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    !water_light_kept()
+        && victory_shader::emit::host_settings()[0] == 32
+        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+}
+
+/// Why a pipeline is never made, if it is left out on purpose.
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if water_light_left_out(shaders) {
+        return Some("the water's tiled light on a host of 32-lane waves (dark blocks, ~15 ms of the card a frame; VICTORY_WATER_LIGHT=1 keeps it)");
+    }
+    None
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
@@ -78,6 +114,15 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key.finalize().to_hex()[..32].to_owned();
+        // Left out: never queued, never made, and draws or dispatches of it are
+        // dropped the way an untranslated shader's are - one `made` of `None`,
+        // set here so a worker cannot take it either.
+        let made = OnceLock::new();
+        if let Some(why) = left_out(&shaders) {
+            let _ = made.set(None);
+            tracing::info!(%key, why, "a pipeline is left out");
+        }
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
@@ -88,8 +133,8 @@ impl Pending {
             was_slow: AtomicBool::new(false),
             queued: OnceLock::new(),
             taken_from: AtomicU8::new(TAKEN_BY_TITLE),
-            made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            made,
+            key,
             used: AtomicBool::new(false),
             given_up: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),

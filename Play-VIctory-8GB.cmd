@@ -31,6 +31,12 @@ rem single lever here and is off by default. Nothing in the engine changes;
 rem set any VICTORY_* yourself to override a line (each is only a default).
 rem ---------------------------------------------------------------------------
 
+rem `Play-VIctory-8GB.cmd warm` is not a run. It makes the pipelines the title uses
+rem ahead of time, from the book the runs write, so that the first world frame does not
+rem compile them while you watch. That compile is the shape of the 300-600 ms frames:
+rem the title wants over 1,200 new pipelines for its first world frame.
+if /i "%~1"=="warm" goto warm
+
 set "profile=%~1"
 if not defined profile set "profile=1080p"
 rem
@@ -49,6 +55,16 @@ rem     pixels under 16 against 0.3 % on the reference build)
 rem They stay settable by hand, and their blocks below say why they are not defaults.
 set "experiments=0"
 if /i "%~2"=="perf" set "experiments=1"
+rem
+rem Third argument `60`: the title asks for 30 fps itself (two sites in its code, plus a
+rem limiter of its own; crates/victory-loader/src/frame_rate.rs documents both), so a run
+rem without this is capped at 33.3 ms whatever the hardware can do. This lifts the interval
+rem to 16.7 ms and gives the title the matching rate. A measurement, not a fix: it makes
+rem visible what the laptop can do, and it can tear.
+if /i "%~3"=="60" (
+    if not defined VICTORY_FRAME_INTERVAL_MS set "VICTORY_FRAME_INTERVAL_MS=16.667"
+    if not defined VICTORY_TITLE_FPS set "VICTORY_TITLE_FPS=60"
+)
 
 if /i "%profile%"=="540p" set "lowres=1"
 if /i "%profile%"=="540p" set "pixels=960x540"
@@ -227,6 +243,11 @@ rem repeats frames of the opening video. Set them to 1 to try instead.
 if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 
+rem The book of the pipelines the title uses, so that `Play-VIctory-8GB.cmd warm` can
+rem make them ahead of a run. A small file, a write per new pipeline, and the only way the
+rem first world frame stops being the longest one of the session.
+if not defined VICTORY_PIPELINE_BOOK set "VICTORY_PIPELINE_BOOK=1"
+
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-8gb"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 
@@ -234,5 +255,21 @@ echo VIctory: %profile% [VICTORY_OUTPUT=%VICTORY_OUTPUT%] experiments=%experimen
 if not "%experiments%"=="1" echo VIctory: three speculative switches are off (no 3D last time? this is the run that draws).
 if "%experiments%"=="1" echo VIctory: three switches ON that have never been seen to render on an 8 GiB card: if the picture is wrong, drop "perf".
 if defined VICTORY_FRAMES echo VIctory: frames to %VICTORY_FRAMES%
+if defined VICTORY_FRAME_INTERVAL_MS echo VIctory: 30 fps lifted to %VICTORY_FRAME_INTERVAL_MS% ms (a measurement, not a fix).
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-x --execute
+
+goto :eof
+
+:warm
+rem The release build plays, so it warms; the diag build warms the same book.
+set "runner=%~dp0target\release\victory.exe"
+if not exist "%runner%" set "runner=%~dp0target\diag\victory.exe"
+if not exist "%runner%" (
+    echo VIctory: no victory.exe built yet: cargo build --release -p victory
+    exit /b 1
+)
+if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-8gb"
+echo VIctory: warming the pipelines the book names, with %runner%
+"%runner%" warm
+
 exit /b %errorlevel%

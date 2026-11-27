@@ -234,6 +234,24 @@ the title clamps: `VICTORY_TEST_LOWRES=1` + `VICTORY_OUTPUT=960x540` presented
 **1280x720** (Logan-Gaillard, 2026-11-27). The launcher now says so before the run rather
 than after it: read the `presenting to a window` line before comparing two runs.
 
+## Ported from VIctory-NVIDIA (2026-11-27)
+
+Their tree and this one share their ancestor (`ffe310eb`, 2026-11-24): 1,193 commits on
+their side, 1,230 here. What came over, and what it is worth:
+
+- **The water's tiled light left out** (`pipeline/make.rs`, `VICTORY_WATER_LIGHT=0`): two
+  programs (`5dc3b25986622949`, `6f225b641c5b0708`) that a 32-lane host only gets in the
+  wave-wide form, where they leave whole tiles of open water dark and cost **about 15 ms of
+  the card a frame** — their measurement on an RTX 5070: 25 fps with them, 30 without. Their
+  tree leaves them out by default; here they are kept unless `VICTORY_WATER_LIGHT=0`, because
+  the water comes out darker and bluer, and a different picture is not a free win.
+- **The pipeline warm-up** (`Play-VIctory-8GB.cmd warm`, `VICTORY_PIPELINE_BOOK=1`): the
+  mechanism was already in this tree; the launcher now uses it, because the compile of
+  >1,200 pipelines at the first world frame is what the 300-600 ms frames are made of.
+- **The title's 30 fps interval, lifted** (`Play-VIctory-8GB.cmd 1080p perf 60`): also
+  already here (`victory-loader/src/frame_rate.rs`), now reachable without knowing the
+  switch. It is the only way to see what the laptop can do.
+
 ## The levers already in the tree, and why only one is switched on
 
 Audited 2026-11-27: every switch that is **off by default** in `victory-gpu`, read from
