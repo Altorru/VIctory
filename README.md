@@ -1,3 +1,7 @@
+> **This fork is for 8 GiB laptop cards, and says so in one place:** [LAPTOP-8GB.md](LAPTOP-8GB.md)
+> (30 fps sustained on an RTX 5070 Laptop, the launcher, the frame CSV, and the four builds
+> the plan is built on). Everything below is upstream's own README.
+
 # victory-leafy
 
 **This may not work for you. You may need to pull certain changes and combine

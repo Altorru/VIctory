@@ -1,0 +1,112 @@
+name: Release 8 GiB
+
+# The CD half: a tag makes the two binaries the launcher can use, and a release
+# carries them. Nothing is built from a branch: a tag is a measurement someone
+# signed their name to, and the numbers in docs/thirty-fps.md belong to a build.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# What comes out, and why each one:
+#   victory-release-vX.exe   smaller and faster; has no frame CSV (`--release`
+#                            has no recorder), so it plays but cannot report
+#   victory-diag-vX.exe      `--profile diag --features diagnostics`; slower,
+#                            writes the frame CSV the plan is built on
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build as a release (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-8gb-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -A warnings
+
+jobs:
+  build:
+    name: build both binaries
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: laptop-8gb-release
+
+      - name: cargo build --release
+        run: cargo build --release -p victory --locked
+      - name: cargo build --profile diag
+        run: cargo build --profile diag -p victory --features diagnostics --locked
+
+      - name: name them for the tag
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          if (-not (Test-Path target/release/victory.exe)) { throw "no release binary" }
+          if (-not (Test-Path target/diag/victory.exe)) { throw "no diag binary" }
+          Copy-Item target/release/victory.exe "victory-release-$tag.exe"
+          Copy-Item target/diag/victory.exe "victory-diag-$tag.exe"
+          # A binary next to its own hashes, so nobody has to trust a download.
+          Get-FileHash "victory-release-$tag.exe" -Algorithm SHA256 | ForEach-Object { "SHA256  $($_.Hash.ToLower())  victory-release-$tag.exe" } | Set-Content SHA256SUMS.txt
+          Get-FileHash "victory-diag-$tag.exe"    -Algorithm SHA256 | ForEach-Object { "SHA256  $($_.Hash.ToLower())  victory-diag-$tag.exe" }    | Add-Content SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: the launcher's supporting files
+        shell: pwsh
+        run: |
+          # The launcher and the plan travel with the binaries: a release that
+          # does not say how it was measured is a file, not a result.
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          if (Test-Path Play-VIctory-8GB.cmd) { Copy-Item Play-VIctory-8GB.cmd "Play-VIctory-8GB-$tag.cmd" }
+          if (Test-Path docs/thirty-fps.md)   { Copy-Item docs/thirty-fps.md "thirty-fps-$tag.md" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-8gb-${{ inputs.tag || github.ref_name }}
+          path: |
+            victory-release-*.exe
+            victory-diag-*.exe
+            SHA256SUMS.txt
+            Play-VIctory-8GB-*.cmd
+            thirty-fps-*.md
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          body: |
+            Two binaries, and nothing of the game in them.
+
+            - `victory-diag-*.exe` — the one the numbers come from: writes the frame
+              CSV (`VICTORY_FRAMES`) and the card spans (`VICTORY_CARD_SPANS=1`).
+            - `victory-release-*.exe` — the same code without the recorder: smaller,
+              faster, and unable to report anything.
+
+            `Play-VIctory-8GB-*.cmd` is the launcher the run was made with; `thirty-fps-*.md`
+            is the plan, with the four builds it is built on and what would falsify it.
+
+            You still need your own dump of the title. No game files, no NVIDIA files.
+          files: |
+            victory-release-*.exe
+            victory-diag-*.exe
+            SHA256SUMS.txt
+            Play-VIctory-8GB-*.cmd
+            thirty-fps-*.md
+          fail_on_unmatched_files: false

@@ -1,0 +1,112 @@
+name: Laptop 8 GiB
+
+# What this branch is for: a build that runs, and numbers that say what it did.
+# Three jobs, in the order they matter on a card with 8 GiB of its own memory:
+#   check  - does the workspace still compile, on the target it ships to
+#   test   - do the crate's own tests still pass
+#   diag   - does the diagnostics build (the frame CSV) still compile, since it
+#            is the only way any of the numbers below can be read back
+#
+# The lint job does NOT fail on warnings: two of them predate this branch (a
+# `manual implementation of .is_multiple_of()` in victory-formats and a
+# collapsible `if` in victory-gpu's build script). Fail on them here and the
+# signal people actually need - "did it compile" - is lost behind noise that
+# someone else owns. They are reported, and the two are named in the log.
+
+on:
+  push:
+    branches: [laptop-8gb]
+  pull_request:
+    branches: [laptop-8gb]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: laptop-8gb-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (windows, msvc)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: laptop-8gb-check
+      - name: cargo check, all targets
+        run: cargo check --workspace --all-targets --locked
+      - name: cargo check, diagnostics feature (the frame CSV)
+        run: cargo check -p victory --features diagnostics --locked
+
+  test:
+    name: test (windows, msvc)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: laptop-8gb-test
+      # The crate this branch changes, and its own unit tests only: the reserve
+      # a small card keeps, the column names of the frame CSV, counters that go
+      # back to zero. Nothing here needs a card, the title or a dump - which is
+      # exactly why it can run on a runner. Tests that do need one are #[ignore]d
+      # upstream and stay that way.
+      - name: cargo test (victory-gpu, lib)
+        run: cargo test -p victory-gpu --lib --locked --no-fail-fast
+        env:
+          RUSTFLAGS: -A warnings
+
+  lint:
+    name: clippy (warnings reported, not fatal)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: laptop-8gb-lint
+      - name: clippy, all targets and features
+        run: cargo clippy --workspace --all-targets --all-features --locked
+        env:
+          RUSTFLAGS: -A warnings
+
+  diag-build:
+    name: diag build (the frame CSV)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    needs: check
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: laptop-8gb-diag
+      - name: cargo build --profile diag
+        run: cargo build --profile diag -p victory --features diagnostics --locked
+        env:
+          RUSTFLAGS: -A warnings
+      - name: the exe is where the launcher looks for it
+        shell: pwsh
+        run: |
+          $exe = "target/diag/victory.exe"
+          if (-not (Test-Path $exe)) { throw "$exe was not built: the launcher picks it up by that path when VICTORY_FRAMES is set" }
+          Get-Item $exe | Select-Object FullName, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-diag-${{ github.sha }}
+          path: target/diag/victory.exe
+          if-no-files-found: error
+          retention-days: 14
