@@ -10,6 +10,33 @@ laptop card with 8 GiB of its own memory** — the machine that exists here is a
 Everything in this repository is either a measurement someone took, or a switch whose
 failure is visible in the picture. Nothing is a claim that has not been run.
 
+## Start here (no build)
+
+1. Download two files from [Releases](https://github.com/Altorru/victory-8gb/releases/latest):
+   **`victory-diag-<tag>.exe`** and **`START-8GB-<tag>.cmd`**.
+2. Put both in the folder that holds your own copy of the title
+   (`game_scarlett_master.exe`).
+3. Rename the `.exe` to **`victory.exe`**.
+4. Double-click **`START-8GB.cmd`**.
+
+It finds the title, records the run to `%LOCALAPPDATA%\VIctory\runs\run-*.csv`, makes the
+pipelines ahead of time (minutes the first time after a new build, and it is why the first
+world frame stops being the longest of the session), starts the game at 1080p with the
+settings that draw, and at the end prints the CSV path. Nothing is written into the game's
+folder.
+
+Then, and in this order, the runs that answer the questions the plan is made of:
+
+| what | why |
+|---|---|
+| `Play-VIctory-8GB.cmd 1080p` | the baseline: does it draw, and how much memory does the card ask for (`ours_*` in the CSV) |
+| `Play-VIctory-8GB.cmd 1080p 60` | lifts the title's own 30 fps interval: **this is the run that shows the laptop's real headroom** |
+| `Play-VIctory-8GB.cmd 1080p perf 60` | adds the three switches that move waits without moving what is drawn |
+| `VICTORY_WATER_LIGHT=0` before a run | leaves out the two tiled water-light programs (~15 ms of the card a frame, dark blocks gone, water darker) |
+
+What comes back is what moves this forward: the CSV, the `presenting to a window` line, and a
+screenshot of the world rather than a menu.
+
 ## Where it stands, in numbers (2026-11-27)
 
 Four builds, one dump, 140 s each, killed by `timeout`, screenshots from the game window.

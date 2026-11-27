@@ -72,6 +72,7 @@ jobs:
           # does not say how it was measured is a file, not a result.
           $tag = "${{ inputs.tag || github.ref_name }}"
           if (Test-Path Play-VIctory-8GB.cmd) { Copy-Item Play-VIctory-8GB.cmd "Play-VIctory-8GB-$tag.cmd" }
+          if (Test-Path START-8GB.cmd)        { Copy-Item START-8GB.cmd        "START-8GB-$tag.cmd" }
           if (Test-Path docs/thirty-fps.md)   { Copy-Item docs/thirty-fps.md "thirty-fps-$tag.md" }
 
       - uses: actions/upload-artifact@v4
@@ -82,6 +83,7 @@ jobs:
             victory-diag-*.exe
             SHA256SUMS.txt
             Play-VIctory-8GB-*.cmd
+            START-8GB-*.cmd
             thirty-fps-*.md
           if-no-files-found: error
           retention-days: 90
@@ -92,21 +94,40 @@ jobs:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: ${{ inputs.tag || github.ref_name }}
           body: |
-            Two binaries, and nothing of the game in them.
+            ## Run it in four steps
 
-            - `victory-diag-*.exe` — the one the numbers come from: writes the frame
-              CSV (`VICTORY_FRAMES`) and the card spans (`VICTORY_CARD_SPANS=1`).
-            - `victory-release-*.exe` — the same code without the recorder: smaller,
-              faster, and unable to report anything.
+            1. Download **`victory-diag-<tag>.exe`** and **`START-8GB-<tag>.cmd`**.
+            2. Put both in the folder that holds your own copy of the title
+               (`game_scarlett_master.exe`).
+            3. Rename `victory-diag-<tag>.exe` to **`victory.exe`**.
+            4. Double-click **`START-8GB-<tag>.cmd`**. It asks once for the title's
+               folder if it cannot find it, records the run to a CSV, makes the
+               pipelines ahead of time, and starts the game at 1080p.
 
-            `Play-VIctory-8GB-*.cmd` is the launcher the run was made with; `thirty-fps-*.md`
-            is the plan, with the four builds it is built on and what would falsify it.
+            When it ends it prints the CSV path: send that file back, plus a
+            screenshot of the world (not a menu). That is the whole ask.
 
-            You still need your own dump of the title. No game files, no NVIDIA files.
+            ## What the two binaries are
+
+            - **`victory-diag-*.exe`** — the one the numbers come from. It writes the
+              frame CSV and the card's own spans; it is slower than the plain build,
+              and it is what this fork is for.
+            - **`victory-release-*.exe`** — the same code without the recorder: smaller,
+              faster, and unable to report anything. For playing, not measuring.
+
+            `Play-VIctory-8GB-*.cmd` is the launcher behind the double-click: sizes
+            `4k`/`1440p`/`1080p`/`936p`/`720p`, `perf` for the three switches that move
+            waits, `60` to lift the title's own 30 fps interval, and `warm` alone to make
+            the pipelines without playing. `thirty-fps-*.md` is the plan: the four builds
+            it is built on, the arithmetic, and what would falsify it.
+
+            Windows 10 2004 or later, a recent NVIDIA driver, 16 GB of RAM or more.
+            Nothing of the game and nothing of NVIDIA's is in these files.
           files: |
             victory-release-*.exe
             victory-diag-*.exe
             SHA256SUMS.txt
             Play-VIctory-8GB-*.cmd
+            START-8GB-*.cmd
             thirty-fps-*.md
           fail_on_unmatched_files: false
