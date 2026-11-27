@@ -37,7 +37,7 @@ jobs:
   build:
     name: build both binaries
     runs-on: windows-latest
-    timeout-minutes: 150
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:

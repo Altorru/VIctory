@@ -1,112 +1,108 @@
 name: Laptop 8 GiB
 
-# What this branch is for: a build that runs, and numbers that say what it did.
-# Three jobs, in the order they matter on a card with 8 GiB of its own memory:
-#   check  - does the workspace still compile, on the target it ships to
-#   test   - do the crate's own tests still pass
-#   diag   - does the diagnostics build (the frame CSV) still compile, since it
-#            is the only way any of the numbers below can be read back
+# ONE job on purpose. Four jobs each compiled this workspace from nothing - four
+# toolchains, four caches, four times the minutes - and the four answers are the
+# same answer: "does the thing this branch changes still build". Here the steps
+# share one target directory, so the second and third cost seconds, not minutes.
 #
-# The lint job does NOT fail on warnings: two of them predate this branch (a
-# `manual implementation of .is_multiple_of()` in victory-formats and a
-# collapsible `if` in victory-gpu's build script). Fail on them here and the
-# signal people actually need - "did it compile" - is lost behind noise that
-# someone else owns. They are reported, and the two are named in the log.
+# The repository is public, so none of this is billed; it is still worth being
+# cheap, because a CI that takes an hour is a CI nobody waits for.
+#
+#   check     the workspace compiles for the target it ships to, all targets
+#   diag      the diagnostics feature compiles (the frame CSV the plan is read from)
+#   test      victory-gpu's own unit tests: reserves, column names, counters
+#   artifact  the exe exists at target/diag/victory.exe, where the launcher looks
+#   lint      clippy, last and NOT fatal: two warnings predate this branch and a
+#             red badge on someone else's two warnings hides the real signal
+#
+# Skipped entirely for documentation-only changes: `paths-ignore` below. A README
+# commit must not compile a game port.
 
 on:
   push:
     branches: [laptop-8gb]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   pull_request:
     branches: [laptop-8gb]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A second push cancels the first: the old answer is worthless, and its minutes
+# are not refundable.
 concurrency:
   group: laptop-8gb-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # No incremental artifacts: they are large, they churn the cache key, and a CI
+  # checkout has nothing to be incremental against.
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  check:
-    name: check (windows, msvc)
+  build:
+    name: windows build, tests, diag, lint
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - run: rustup show active-toolchain
+
+      # One cache for the whole job, keyed by Cargo.lock: changed dependencies
+      # rebuild, a changed source file does not.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: laptop-8gb-check
-      - name: cargo check, all targets
+          shared-key: laptop-8gb
+          # Only what the four steps below compile against.
+          cache-on-failure: false
+
+      - name: check, all targets
         run: cargo check --workspace --all-targets --locked
-      - name: cargo check, diagnostics feature (the frame CSV)
+
+      - name: check, diagnostics feature (the frame CSV)
         run: cargo check -p victory --features diagnostics --locked
 
-  test:
-    name: test (windows, msvc)
-    runs-on: windows-latest
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v5
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: laptop-8gb-test
-      # The crate this branch changes, and its own unit tests only: the reserve
-      # a small card keeps, the column names of the frame CSV, counters that go
-      # back to zero. Nothing here needs a card, the title or a dump - which is
-      # exactly why it can run on a runner. Tests that do need one are #[ignore]d
-      # upstream and stay that way.
-      - name: cargo test (victory-gpu, lib)
+      - name: test (victory-gpu, lib)
+        # Nothing here needs a card, the title or a dump, which is why it can run
+        # on a runner at all.
         run: cargo test -p victory-gpu --lib --locked --no-fail-fast
         env:
           RUSTFLAGS: -A warnings
 
-  lint:
-    name: clippy (warnings reported, not fatal)
-    runs-on: windows-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: laptop-8gb-lint
-      - name: clippy, all targets and features
-        run: cargo clippy --workspace --all-targets --all-features --locked
-        env:
-          RUSTFLAGS: -A warnings
-
-  diag-build:
-    name: diag build (the frame CSV)
-    runs-on: windows-latest
-    timeout-minutes: 120
-    needs: check
-    steps:
-      - uses: actions/checkout@v5
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: laptop-8gb-diag
-      - name: cargo build --profile diag
+      - name: diag build (the launcher's path)
         run: cargo build --profile diag -p victory --features diagnostics --locked
         env:
           RUSTFLAGS: -A warnings
+
       - name: the exe is where the launcher looks for it
         shell: pwsh
         run: |
           $exe = "target/diag/victory.exe"
-          if (-not (Test-Path $exe)) { throw "$exe was not built: the launcher picks it up by that path when VICTORY_FRAMES is set" }
-          Get-Item $exe | Select-Object FullName, Length
+          if (-not (Test-Path $exe)) { throw "$exe was not built: Play-VIctory-8GB.cmd picks it up by that path when VICTORY_FRAMES is set" }
+          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          "built: $exe ($mb MB)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
       - uses: actions/upload-artifact@v4
         with:
           name: victory-diag-${{ github.sha }}
           path: target/diag/victory.exe
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
+          compression-level: 0
+
+      # Last, and not fatal. Reported in the run, never the reason it is red.
+      - name: clippy (reported, not fatal)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --all-features --locked --message-format short
+        env:
+          RUSTFLAGS: -A warnings
