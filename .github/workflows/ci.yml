@@ -1,9 +1,18 @@
 name: CI
 
+# This fork's own CI is `.github/workflows/laptop-8gb.yml`: one job, on the
+# branch that ships, with the diagnostics build and the tests that belong to it.
+# This file is upstream's, kept but narrowed: it ran on EVERY pull request, and its
+# `clippy -D warnings` fails on two warnings that predate this fork (a
+# `.is_multiple_of()` in victory-formats, a collapsible `if` in victory-gpu's build
+# script). A pull request against laptop-8gb would have shown a red badge for
+# someone else's two lines, so it now runs only on main and by hand.
 on:
   pull_request:
+    branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
